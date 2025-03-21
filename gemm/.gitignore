@@ -1,0 +1,14 @@
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+.idea
+
+# Build files
+build
+cmake-build-debug/
+cmmake-build-release/
+
+.vscode/
