@@ -8,7 +8,7 @@ int main()
 {
     print_device_info();
 
-    constexpr size_t num_repeats{1U};
+    constexpr size_t num_repeats{1000U};
     constexpr size_t num_warmups{1U};
 
     __half fp16_abs_tol{__float2half(5.0e-2f)};
@@ -60,9 +60,12 @@ int main()
             //{"Custom GEMM Kernel WMMA Tiling 128x128", cuda_gemm_wmma_1<__half>},
             //{"Custom GEMM Kernel WMMA Tiling 128x128 V2", cuda_gemm_wmma_2<__half>},
             //{"Custom GEMM Kernel WMMA Tiling 128x128 V3", cuda_gemm_wmma_3<__half>},
-            // {"Custom GEMM Kernel WMMA Tiling 128x128 bank conflict V4", cuda_gemm_wmma_4<__half>},
-            {"Custom GEMM Kernel WMMA Tiling 64x64 4 warp double buffer", cuda_gemm_wmma_5<__half>},
+            //{"Custom GEMM Kernel WMMA Tiling 128x128 bank conflict V4", cuda_gemm_wmma_4<__half>},
+            //{"Custom GEMM Kernel WMMA Tiling 64x64 4 warp double buffer", cuda_gemm_wmma_5<__half>},
             {"Custom GEMM Kernel WMMA Tiling 64x64 8 warp double buffer", cuda_gemm_wmma_6<__half>},
+            //{"Custom GEMM Kernel WMMA Tiling ldmatrix and mma V8", cuda_gemm_wmma_8<__half>},
+            //{"Custom GEMM Kernel WMMA Tiling ldmatrix and mma V9", cuda_gemm_wmma_9<__half>},
+            {"Custom GEMM Kernel WMMA Tiling ldmatrix and mma V10", cuda_gemm_wmma_10<__half>},
         };
 
     for (auto const& gemm_fp16_kernel_launch_function :

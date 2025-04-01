@@ -1,428 +1,357 @@
-// // /*
-// //  * Copyright 1993-2017 NVIDIA Corporation.  All rights reserved.
-// //  *
-// //  * Please refer to the NVIDIA end user license agreement (EULA) associated
-// //  * with this source code for terms and conditions that govern your use of
-// //  * this software. Any use, reproduction, disclosure, or distribution of
-// //  * this software and related documentation outside the terms of the EULA
-// //  * is strictly prohibited.
-// //  *
-// //  */
-
-// // // CUDA sample demonstrating a GEMM computation using the Warp Matrix Multiply
-// // // and Accumulate API introduced in CUDA 9.
-
-// // // In this program, the compute_gemm kernel computes the result of a matrix multiplication
-// // // and addition: D = alpha * A * B + beta * C. The dimensions of both C and D matrices
-// // // are M_GLOBAL x N_GLOBAL. The A matrix is M_GLOBAL x K_GLOBAL (row-major), the B matrix
-// // // is K_GLOBAL x N_GLOBAL (column-major).
-// // // In that kernel, each CTA computes one 128 x 128 tile of the resulting matrix
-// // // per iteration. When the tile is computed, the CTA stores it to the global memory
-// // // and begins a new iteration, selecting a new 128 x 128 tile to compute.
-// // // Each CTA consists of eight warps. For the 128 x 128 tile, each warp computes eight
-// // // 16 x 16 subtiles, organized in a 2 x 4 two-dimensional array.
-// // // Warps compute the 16 x 16 subtiles using nvcuda::wmma::mma_sync operations by
-// // // moving through the K_GLOBAL dimension of the A and B matrices and accumulating
-// // // the intermediate result in the local thread state.
-
-// // // There are a number of simple optimizations used in the algorithm:
-// // // - The CTA copies the 128 x 128 tile of the C matrix from the global memory to
-// // //   shared memory. After that is done, each warp loads the C matrix fragments from
-// // //   shared memory, thus avoiding a random global memory access.
-// // // - On each internal iteration, the CTA copies a portion of the A and B matrices from
-// //   global memory to shared memory. After that, all warps in the CTA reuse the A and B
-// // //   data from shared memory, thus reducing the number of data copies from global memory.
-// // // - The portions of the A and B matrices are stored in shared memory with an additional
-// // //   padding (skew) to reduce the number of shared memory access bank conflicts.
-// // //   (See a detailed explanation near the SKEW_HALF macro definition.)
-// // // - When the CTA finishes computing the tiles of the resulting matrix, each warp stores
-// // //   its subtiles to shared memory. The CTA then copies the shared memory contents to
-// // //   global memory, again avoiding redundant random global memory accesses.
-// // // - Note that the CTA tile size is chosen to maximize the GPU register utilization,
-// // //   but carefully enough to avoid local memory use.
-
-// // /*
-// // 算法输入：
-// // A: MxK矩阵, row_major
-// // B: KxN矩阵, col_major
-// // C: MxN矩阵, row_major
-// // alpha: 系数
-// // beta: 系数
-// // C = alpha * A * B + beta * C
-
-// // CTA:Cooperative thread arrays，合作线程数组/合作线程阵列
-// // 一个CTA由8个warp，32x8个线程组成，计算一个C矩阵(结果矩阵)中的128x128的小块。
-// // 在一个128x128的块内，进一步划分成8份16x16x2x4块。对应8个warp，每个warp计算2x4x16x16的子块，组织成2x4的16x16的块。
-// // 计算每个16x16的子块时，通过wmma::mma_sync操作，沿着A和B矩阵的K维度移动，将中间结果累积本地线程的缓存中，也就是每个线程需要一个2x4的缓存用来保存结果。
-
-// // 相比于wmma_0中的实现，本算法有有以下优化：
-// // 1. CTA将C矩阵的128x128块从全局内存复制到共享内存，然后每个warp从共享内存中加载C矩阵的片段，避免了随机全局内存访问。而wmma_0中每个warp直接从全局内存中加载C矩阵的片段。
-// // 2. 在每个内部迭代中，CTA将A和B矩阵的一部分从全局内存复制到共享内存，然后CTA中的所有warp都从共享内存中重用A和B数据，从而减少了从全局内存中复制数据的次数。
-// // 3. A和B矩阵的部分存储在共享内存中，带有额外的填充(skew)，以减少共享内存访问冲突?
-// // 4. 在写回的时候，同样利用了shared memory，避免了冗余的随机全局内存访问。
-
-// // 注意：CTA的大小被选择为最大化GPU寄存器利用率，需要小心使用，避免用超了使用本地内存。
-// // */
-
-// #include "cuda_gemm.hpp"
-// #include "cuda_gemm_utils.cuh"
-
-//  #include <cuda_fp16.h>
-//  #include <mma.h>
-//  #include <cuda_runtime.h>
-//  #include <iostream>
-
-// // using namespace nvcuda;
-
-// // #ifndef WARP_SIZE
-// // #define WARP_SIZE (32)
-// // #endif // WARP_SIZE
-
-// // #define WMMA_M 16  // 16x16x16 矩阵乘法
-// // #define WMMA_N 16
-// // #define WMMA_K 16
-
-// // // MMA matrix tile dimensions. (16, 16, 16), (32, 8, 16), and (8, 32, 16) are
-// // // currently supported.
-// // static const int M = 16;
-// // static const int N = 16;
-// // static const int K = 16;
-
-// // // Implementation constants.
-// // static const int WARPS_PER_BLOCK   = 8;
-// // static const int THREADS_PER_BLOCK = (WARP_SIZE * WARPS_PER_BLOCK);
-
-// // static const int CHUNK_K = 8;
-
-// // static const int BLOCK_ROW_WARPS = 2;
-// // static const int BLOCK_COL_WARPS = 4;
-
-// // static const int WARP_ROW_TILES = 4;
-// // static const int WARP_COL_TILES = 2;
-
-// // static const int BLOCK_ROW_TILES = (WARP_ROW_TILES * BLOCK_ROW_WARPS); // 8
-// // static const int BLOCK_COL_TILES = (WARP_COL_TILES * BLOCK_COL_WARPS); // 8
-
-// // static const int SHMEM_STRIDE = (N * BLOCK_ROW_TILES); // 128
-// // static const int SHMEM_OFFSET = (N * WARP_ROW_TILES);  // 64
-
-// // /*
-// // 从上面的定义就可以看出，一个Block有32x8个线程，也就是8个warp，每个warp计算一个2x4的16x16的子块。
-// // 一个Block会被分成2x4个Block_Tile,也就是对应的BLOCK_ROW_WARPS x BLOCK_COL_WARPS。
-// // 每个Block_Tile会被分成4x2个Warp_Tile，也就是对应的WARP_ROW_TILES x WARP_COL_TILES。
-
-// // 每个warp计算一个Block_Tile的结果。
-// // */
-
-// // #define C_LAYOUT wmma::mem_row_major
-
-// // // The macro below is used to shift rows of the A matrix and columns of the B
-// // // matrix in shared memory to minimize possible bank conflicts. Before
-// // // performing the nvcuda::wmma::mma_sync operation, the warp must load the
-// // // matrix data using the nvcuda::wmma::load_matrix_sync operation. Although the
-// // // memory access pattern is not specified for that function, each lane in the
-// // // warp can read one or multiple matrix elements from different matrix rows or
-// // // columns. For shared memory, such access can result in bank conflicts if
-// // // different rows / columns of the matrix map to the same bank. By shifting each
-// // // row and column by a few bytes, we make sure that they map to different banks,
-// // // thus reducing the number of possible bank conflicts. The number of 8 two-byte
-// // // "half" elements is chosen as the minimum possible shift because we must keep
-// // // each row and column 128-bit aligned, as required by
-// // // nvcuda::wmma::load_matrix_sync.
-
-// // /*
-// // 这里通过shift 8个half元素来解决shared memory的bank conflict问题的方法没看懂？
-// // */ 
-// // static const int SKEW_HALF = 8;
-
-// // // static __global__ void gemm_wmma_kernel_fp32(size_t M_GLOBAL, size_t N_GLOBAL, size_t K_GLOBAL, __half *A, __half *B, __half *C, __half alpha, __half beta) 
-// // // {
-// // //     extern __shared__ __half shmem[][CHUNK_K * K + SKEW_HALF]; // 为什么要用extern？答：因为这个数组是在每个Block中共享的，所以需要extern声明
-
-// // //     // block tile
-// // //     const auto M_TILES = M_GLOBAL / M;
-// // //     const auto N_TILES = N_GLOBAL / N;
-// // //     const auto K_TILES = K_GLOBAL / K;
-
-// // //     const unsigned int warpId = threadIdx.y; // 8
-// // //     const unsigned int laneId = threadIdx.x; // 32
-
-// // //     // offset in shared memory from which the B matrix is stored
-// // //     const size_t shmem_idx_b_off = BLOCK_ROW_TILES * M; // 8 * 16 = 128
- 
-// // //     // This pointer is used to access the C and D matrix tiles this warp computes.
-// // //     // 这里注意，128x128，先被切成2x4的block tile，每个block tile被切成4x2的warp tile。这里也就要存储4x2的warp tile大小的数据。
-
-// // //     /*
-    
-    
-    
-// // //     */
-// // //     half *shmem_warp_tile_ptr = (half *) &shmem[0][0] +
-// // //                                 (warpId / 2) * SHMEM_STRIDE * K * 2 +
-// // //                                 (warpId % 2) * SHMEM_OFFSET; // 内部跳转，这里是交错存储的吗？
-
-
-// // //     // This pointer is used to stream the C and D matrices block-wide tile to and from shared memory.
-// // //     half *shmem_warp_stream_ptr = (half *) &shmem[0][0] + warpId * SHMEM_STRIDE * K;
- 
-// // //     // Adjust the beta scaler, as it'll be multiplied by alpha at the end of
-// // //     // each tile computation. Technically this is not generally correct (may
-// // //     // result in a loss of precision). Zero still needs to be specially handled
-// // //     // though.
-// // //     beta /= alpha;
-// // // }
-
-// // static __global__ void gemm_wmma_kernel_fp16(size_t M_GLOBAL, size_t N_GLOBAL, size_t K_GLOBAL, __half *A, __half *B, __half *C, __half alpha, __half beta) 
-// // {
-// //     extern __shared__ __half shmem[][CHUNK_K * K + SKEW_HALF]; // 为什么要用extern？答：因为这个数组是在每个Block中共享的，所以需要extern声明
-
-// //     // block tile
-// //     const auto M_TILES = M_GLOBAL / M;
-// //     const auto N_TILES = N_GLOBAL / N;
-// //     const auto K_TILES = K_GLOBAL / K;
-
-// //     const unsigned int warpId = threadIdx.y; // 8
-// //     const unsigned int laneId = threadIdx.x; // 32
-
-// //     // offset in shared memory from which the B matrix is stored
-// //     const size_t shmem_idx_b_off = BLOCK_ROW_TILES * M; // 8 * 16 = 128
- 
-// //     // 将C和D
-// //     // This pointer is used to access the C and D matrix tiles this warp computes.
-// //     // 这里注意，128x128，先被切成2x4的block tile，每个block tile被切成4x2的warp tile。这里也就要存储4x2的warp tile大小的数据。
-// //     half *shmem_warp_tile_ptr = (half *) &shmem[0][0] +
-// //                                 (warpId / 2) * SHMEM_STRIDE * K * 2 +
-// //                                 (warpId % 2) * SHMEM_OFFSET; // 内部跳转，这里是交错存储的吗？
-
-
-// //     // This pointer is used to stream the C and D matrices block-wide tile to and from shared memory.
-// //     half *shmem_warp_stream_ptr = (half *) &shmem[0][0] + warpId * SHMEM_STRIDE * K;
- 
-// //     // Adjust the beta scaler, as it'll be multiplied by alpha at the end of
-// //     // each tile computation. Technically this is not generally correct (may
-// //     // result in a loss of precision). Zero still needs to be specially handled
-// //     // though.
-// //     beta /= alpha;
-
-// //     // Each CTA slides along the 128 x 128 tiles from the top left corner of the
-// //     // matrix to the right and down, and selects the next tile to compute. Once
-// //     // there's no such tile, all warps in this CTA exit.
-// //     for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) 
-// //     /*
-// //     这里是将CTA划分到具体的block中去，gridDim.x是所有的SM数量，代表着一个循环。
-// //     block_pos是当前SM的编号。
-
-// //     下面的代码还是按照16x16的块划分？
-// //     */
-// //     {
-// //         const unsigned int block_tile_i =
-// //             ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
-// //         const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
-// //         // 将128x128的C矩阵划分成8x8的tile
-        
-// //         // Stop when there are no more D matrix tiles to compute in this CTA.
-// //         if (block_tile_i >= M_TILES) {
-// //         break;
-// //         }
-
-// //         // This warp's pointer to the C matrix data to copy memory from to shared
-// //         // memory.
-// //         const size_t gmem_idx =
-// //             (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
-// //         const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
-
-// //     // Stream multiple C tiles to shared memory.
-// // #pragma unroll
-// //         for (int i = 0; i < K; i++) {
-// //         typedef int4 copy_t;
-
-// //         *((copy_t *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId) =
-// //             *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
-// //                 laneId);
-// //         }
-
-// //         __syncthreads();
-
-// //         // These fragments will accumulate the result of A and B matrix fragment
-// //         // multiplications along the K_GLOBAL dimension.
-// //         wmma::fragment<wmma::accumulator, M, N, K, float> c[WARP_COL_TILES]
-// //                                                        [WARP_ROW_TILES];
-
-// //         // Load the C matrix tiles into fragments from shared memory.
-// // #pragma unroll
-// //         for (int i = 0; i < WARP_COL_TILES; i++) {
-// // #pragma unroll
-// //             for (int j = 0; j < WARP_ROW_TILES; j++) {
-// //                 const float *tile_ptr =
-// //                     shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
-
-// //                 wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
-// //             }
-// //         }
-
-// //         __syncthreads();
-
-// //     // Scale the C matrix.
-// // #pragma unroll
-// //         for (int i = 0; i < WARP_COL_TILES; i++) {
-// // #pragma unroll
-// //             for (int j = 0; j < WARP_ROW_TILES; j++) {
-// // #pragma unroll
-// //                 for (int t = 0; t < c[i][j].num_elements; t++) {
-// //                 c[i][j].x[t] *= beta;
-// //                 }
-// //             }
-// //         }
-
-// //         // Select what warp copies what matrix to shared memory.
-// //         // Warps 0-3 copy the A matrix, warps 4-7 copy the B matrix.
-// //         const half *warp_ptr = (warpId < 4) ? (&A[block_tile_i * M * K_GLOBAL] +
-// //                                             M * K_GLOBAL * (warpId % 4) * 2)
-// //                                             : (&B[block_tile_j * N * K_GLOBAL] +
-// //                                             N * K_GLOBAL * (warpId % 4) * 2);
-
-// //         // Go through the global K dimension by a fixed step at a time.
-// // #pragma unroll
-// //         for (int tile_k = 0; tile_k < K_TILES; tile_k += CHUNK_K) {
-// //         // Copy slices of the A and B matrices to shared memory.
-// //         // The first half of the warps in the CTA copy the A matrix, the rest copy
-// //         // the B matrix.
-// //         size_t shmem_idx =
-// //             warpId < (WARPS_PER_BLOCK / 2)
-// //                 ? (M * (warpId % (WARPS_PER_BLOCK / 2)) * 2)
-// //                 : (N * (warpId % (WARPS_PER_BLOCK / 2)) * 2 + shmem_idx_b_off);
-
-// //         // First half of the warp copies the first row / column of the matrix,
-// //         // the second half of the warp copies the next.
-// //         int4 *lane_ptr = (int4 *)(warp_ptr + tile_k * K +
-// //                                     (laneId / CHUNK_COPY_LINE_LANES) * K_GLOBAL) +
-// //                         (laneId % CHUNK_COPY_LINE_LANES);
-
-// //         // Shift the second half of the warp to the next row / column in the
-// //         // shared memory.
-// //         shmem_idx += laneId / CHUNK_COPY_LINE_LANES;
-
-// // #pragma unroll
-// //         for (int i = 0; i < ((WARP_SIZE / 2) / CHUNK_COPY_LINES_PER_WARP) * 2;i++) 
-// //         {
-// //             // Copy 16 bytes at once in each lane.
-// //             *((int4 *)&shmem[shmem_idx][0] + (laneId % CHUNK_COPY_LINE_LANES)) =
-// //                 *lane_ptr;
-
-// //             // Advance the global memory pointer and the shared memory index.
-// //             lane_ptr =
-// //                 (int4 *)((half *)lane_ptr + K_GLOBAL * CHUNK_COPY_LINES_PER_WARP);
-// //             shmem_idx += CHUNK_COPY_LINES_PER_WARP;
-// //         }
-
-// //         __syncthreads();
-
-// //         // Compute a grid of C matrix tiles in each warp.
-// // #pragma unroll
-// //         for (int k_step = 0; k_step < CHUNK_K; k_step++) {
-// //             wmma::fragment<wmma::matrix_a, M, N, K, half, wmma::row_major>
-// //                 a[WARP_COL_TILES];
-// //             wmma::fragment<wmma::matrix_b, M, N, K, half, wmma::col_major>
-// //                 b[WARP_ROW_TILES];
-
-// // #pragma unroll
-// //             for (int i = 0; i < WARP_COL_TILES; i++) 
-// //             {
-// //                 size_t shmem_idx_a = (warpId / 2) * M * 2 + (i * M);
-// //                 const half *tile_ptr = &shmem[shmem_idx_a][k_step * K];
-
-// //                 wmma::load_matrix_sync(a[i], tile_ptr, K * CHUNK_K + SKEW_HALF);
-
-// // #pragma unroll
-// //                 for (int j = 0; j < WARP_ROW_TILES; j++) 
-// //                 {
-// //                     if (i == 0) 
-// //                     {
-// //                         // Load the B matrix fragment once, because it is going to be
-// //                         // reused against the other A matrix fragments.
-// //                         size_t shmem_idx_b = shmem_idx_b_off +
-// //                                             (WARP_ROW_TILES * N) * (warpId % 2) +
-// //                                             (j * N);
-// //                         const half *tile_ptr = &shmem[shmem_idx_b][k_step * K];
-
-// //                         wmma::load_matrix_sync(b[j], tile_ptr, K * CHUNK_K + SKEW_HALF);
-// //                     }
-
-// //                     wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
-// //                 }
-// //             }
-// //         }
-
-// //       __syncthreads();
-// //     }
-
-// //       // Store the D fragments to shared memory.
-// // #pragma unroll
-// //     for (int i = 0; i < WARP_COL_TILES; i++) {
-// // #pragma unroll
-// //         for (int j = 0; j < WARP_ROW_TILES; j++) {
-// // #pragma unroll
-// //             // Uniform, point-wise transformations of ALL fragment elements by ALL
-// //             // threads in the warp are well-defined even though element indices
-// //             // within fragment storage are not defined.
-// //             for (int t = 0; t < c[i][j].num_elements; t++) c[i][j].x[t] *= alpha;
-
-// //             float *tile_ptr = shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
-
-// //             wmma::store_matrix_sync(tile_ptr, c[i][j], SHMEM_STRIDE, C_LAYOUT);
-// //         }
-// //     }
-
-// //     __syncthreads();
-
-// //     // Now that shared memory contains all the D tiles, stream them to global
-// //     // memory.
-// //     float *dst_gmem_warp_stream_ptr = &D[gmem_idx];
-
-// // #pragma unroll
-// //     for (int i = 0; i < K; i++) 
-// //     {
-// //         *((int4 *)(dst_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) + laneId) =
-// //             *((int4 *)(shmem_warp_stream_ptr + SHMEM_STRIDE * i) + laneId);
-// //     }
-
-// //     __syncthreads();
-// //   }
-// // }
-
-// template <typename T>
-// void cuda_gemm_wmma_6(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream)
-// {
-//     std::cout<<"Unsupported data type: "<<typeid(T).name()<<std::endl;
-// }
-
-// // // GEMM API: 调用 Kernel 并管理 Stream
-// // template <>
-// // void cuda_gemm_wmma_1<__half>(size_t M, size_t N, size_t K,
-// //     __half *A, __half *B, __half *C, 
-// //     __half alpha, __half beta, cudaStream_t stream) {
-
-// //     const int BLOCK_SIZE = 128;
-// //     dim3 blockDim(32, 8, 1);  // 每个 Block 32x8 线程，也就是8个warp，这里的x=32, y=8，x是内循环，y是外循环
-// //     dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
-
-// //     gemm_wmma_kernel<<<gridDim, blockDim, 0, stream>>>(M, N, K, A, B, C, alpha, beta);
-// //     CHECK_LAST_CUDA_ERROR();
-// // }
-
-// // template <>
-// // void cuda_gemm_wmma_1<float>(size_t m, size_t n, size_t k, float* A, float* B, float* C, float alpha, float beta, cudaStream_t stream)
-// // {
-// //     const int BLOCK_SIZE = 128;
-// //     dim3 blockDim(32, 8, 1);  // 每个 Block 32x8 线程，也就是8个warp，这里的x=32, y=8，x是内循环，y是外循环
-// //     dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
-
-// //     gemm_wmma_kernel<<<gridDim, blockDim, 0, stream>>>(M, N, K, A, B, C, alpha, beta);
-// //     CHECK_LAST_CUDA_ERROR();
-// //     CHECK_LAST_CUDA_ERROR();
-// // }
-
-// template GEMM_EXPORT void cuda_gemm_wmma_6<float>(size_t m, size_t n, size_t k, float *A, float *B, float *C, float alpha, float beta, cudaStream_t stream);
-// template GEMM_EXPORT void cuda_gemm_wmma_6<__half>(size_t m, size_t n, size_t k, __half* A, __half* B, __half* C, __half alpha, __half beta, cudaStream_t stream);
+#include "cuda_gemm.hpp"
+#include "cuda_gemm_utils.cuh"
+
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <cuda_runtime.h>
+#include <iostream>
+
+using namespace nvcuda;
+
+/*
+优化思路：在v4基础上，将wmma加载和计算指令，替换成ldmatrix和mma.sync。
+实际上直接替换完之后，速度更慢了。从70%到56%，ns compute显示：内存访问效率更低。
+*/
+
+#define BLOCK_SIZE 128
+#define BLOCK_SIZE_DIV2 64 //128/4
+#define BLOCK_SIZE_DIV4 32 //128/4
+#define BLOCK_SIZE_DIV8 16 //128/4
+
+#define WARP_SIZE 32
+
+#define WMMA_M 16  // 16x16x16 矩阵乘法
+#define WMMA_N 16
+#define WMMA_K 16
+
+/*
+将 128x128 的块划分成 2x4 的block tile块，每个块一个warp，每块大小是：64x32
+进一步将 64x32 的块划分成 4x2 的sub block tile块，每个块一个warp，每块大小是：16x16
+8个warp在计算时，也被编排成2x4的组合。
+其中，要申请C的wmma fragment大小和block tile块一致，2x4 fragment空间，每个空间被一个warp使用。
+*/
+
+static const int BLOCK_ROW_WARPS = 2;
+static const int BLOCK_COL_WARPS = 4;
+
+static const int WARP_ROW_TILES = 4;
+static const int WARP_COL_TILES = 2;
+
+static const int BLOCK_TILE_ROW_STRIP = WARP_ROW_TILES * WMMA_M; // 64
+static const int BLOCK_TILE_COL_STRIP = WARP_COL_TILES * WMMA_N; // 32
+
+static const int BLOCK_ROW_TILES = (WARP_ROW_TILES * BLOCK_ROW_WARPS); // 8
+static const int BLOCK_COL_TILES = (WARP_COL_TILES * BLOCK_COL_WARPS); // 8
+
+static const int SHMEM_STRIDE = (WMMA_N * BLOCK_ROW_TILES); // 128
+
+static const int K_TILES = BLOCK_SIZE / WMMA_K; // 8
+
+static const int SKEW_HALF = 8;
+
+static const int BLOCK_SKEW_SIZE = BLOCK_SIZE + SKEW_HALF;
+static const int BLOCK_SKEW_SIZE_DIV4 = BLOCK_SKEW_SIZE / 4;
+static const int BLOCK_SKEW_SIZE_DIV2 = BLOCK_SKEW_SIZE / 2;
+
+// Kernel: Tensor Core GEMM using WMMA API
+static __global__ void gemm_wmma_kernel_fp16_v8(size_t M, size_t N, size_t K, 
+    __half *A, __half *B, __half *C, 
+    __half alpha, __half beta) 
+{
+    int M_TILES = M / BLOCK_SIZE;
+    int N_TILES = N / BLOCK_SIZE;
+
+    // 首先确定当前属于哪个block，然后确定当前属于哪个warp
+    int warpLaneId = threadIdx.x;   // 32
+    int warpId = threadIdx.y;       // 8
+    int loadABWarpId = warpId % 4;  // 0-3 一组，4-7一组 // 4
+    int loadAB = warpId / 4;  // 分成两组，0: load A, 1: load B, // 2 
+
+    // 继续将一个warp中的thread分成2x2的形式。对应16x16的小块，用来指引ldmatrix 的行起始位置的地址
+    int warp4 = warpLaneId/8;  // 将warp 分成4分
+    int warp8 = warpLaneId%8;
+    int warp4_col = warp4 % 2; // 根据warp的id，确定获取哪个8x8的头。
+    int warp4_row = warp4 / 2;
+
+    int warp_div4 = warpLaneId / 4;
+    int warp_div44 = warpLaneId % 4;
+
+    int blockIdm = blockIdx.y;
+    int blockIdn = blockIdx.x;
+
+    size_t K_div = K / 2;
+
+    extern __shared__ half SMEM[];
+
+    half* As = SMEM;
+    half *Bs = As + BLOCK_SIZE * BLOCK_SKEW_SIZE;
+    half *Cs = SMEM;
+
+    size_t blockM = blockIdm * BLOCK_SIZE;
+    size_t blockN = blockIdn * BLOCK_SIZE;
+
+    // load C: 方案2，用int2指针，int2 = 4 x half，32个线程，每个线程处理4个half，一次128个，刚好一行
+    int2* Csub = (int2 *)(C + (BLOCK_SIZE_DIV8 * warpId + blockM) * N + blockN) + warpLaneId;
+    int2* Cs_i2 = (int2 *)(Cs + warpId * BLOCK_SIZE_DIV8 * BLOCK_SKEW_SIZE) + warpLaneId;
+    const size_t N_DIV4 = N / 4;
+    #pragma unroll
+    for (int i = 0; i < BLOCK_SIZE_DIV8; i++) 
+    {
+        *(Cs_i2 + BLOCK_SKEW_SIZE_DIV4 * i) = *(Csub + i * N_DIV4);
+    }
+
+    __syncthreads();
+
+    // 将C加载到wmma中
+    uint32_t c_frag[WARP_ROW_TILES * WARP_COL_TILES * 4];
+    // wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_wmma[WARP_ROW_TILES][WARP_COL_TILES]; // 4x2
+
+    // 跳转到内部的block tile对应的位置
+    half* Csub_0 = Cs + loadAB * BLOCK_TILE_ROW_STRIP * BLOCK_SKEW_SIZE + loadABWarpId * BLOCK_TILE_COL_STRIP;
+    #pragma unroll
+    for (int i = 0; i < WARP_ROW_TILES; i++)
+    {
+        #pragma unroll
+        for (int j = 0; j < WARP_COL_TILES; j++)
+        {
+            // 跳转到内部sub block tile 对应的位置
+            // half* Csub_wmma = Csub_0 + i * WMMA_M * BLOCK_SKEW_SIZE + j * WMMA_N;
+            half* ptr = Csub_0 + i * WMMA_M * BLOCK_SKEW_SIZE + j * WMMA_N + (warp8 + warp4_row * 8) * BLOCK_SKEW_SIZE + warp4_col * 8;
+
+            uint32_t smem_ptr;
+            asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 "
+                "%0, smem_ptr; }\n"
+                : "=r"(smem_ptr)
+                : "l"(ptr));
+
+            int ij = i * WARP_COL_TILES * 4;
+            asm volatile(
+                "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(c_frag[ij + j * 4]), "=r"(c_frag[ij + j * 4 + 1]), "=r"(c_frag[ij + j * 4 + 2]), "=r"(c_frag[ij + j * 4 + 3])
+                : "r"(smem_ptr));
+            // wmma::load_matrix_sync(c_wmma[i][j], Csub_wmma, BLOCK_SKEW_SIZE, wmma::mem_row_major);
+        }
+    }
+
+    // scale C
+// Scale the C matrix.
+        half* c_half = (half*)c_frag;
+        int c_size = WARP_ROW_TILES * WARP_COL_TILES * 4;
+#pragma unroll
+    for (int i = 0; i < c_size; i++) {
+        c_half[i] *= beta;
+    }
+//     for (int i = 0; i < WARP_ROW_TILES; i++) {
+// #pragma unroll
+//         for (int j = 0; j < WARP_COL_TILES; j++) {
+// #pragma unroll
+            
+//             for (int t = 0; t < c_wmma[i][j].num_elements; t++) {
+//                 c_wmma[i][j].x[t] *= beta;
+//             }
+//         }
+//     }
+    /*
+    将warp 分成两组，0组load A，1 组load B
+    */
+
+    size_t dst_jump = threadIdx.y < 4 ? 0 : BLOCK_SIZE * BLOCK_SKEW_SIZE;
+    half* src_ptr = loadAB == 0 ? A + blockM * K : B + blockN;
+    half* dst_ptr = As + dst_jump;
+
+    size_t b_strip = loadAB == 0 ? 1 : N; // Block strip
+    size_t k_strip = loadAB == 0 ? K : N; // inner BLOCK_SIZE strip
+    size_t k_strip_DIV4 = k_strip / 4; // inner BLOCK_SIZE strip
+    size_t k_strip_DIV2 = k_strip / 2; // inner BLOCK_SIZE strip
+
+    /*
+    对于长度为128x128的half，转换为64x64的int，两个warp正好一次处理一行。
+    在将8个warp划分为A和B两组后，一组有4个warp，进一步，再划分两小组，每小组2个warp一次能够处理一行。
+    */
+
+    // 替换成float 解决bank conflict
+
+    int loadABWarpId_DIV2 = loadABWarpId % 2; // 将4个warp划分为两组，每组2个warp
+    int loadABWarpId_DIV22 = loadABWarpId / 2; // 将4个warp划分为两组，每组2个warp
+    src_ptr += loadABWarpId_DIV22 * BLOCK_SIZE_DIV2 * k_strip + (loadABWarpId_DIV2 * WARP_SIZE + warpLaneId) * 2;
+    dst_ptr += loadABWarpId_DIV22 * BLOCK_SIZE_DIV2 * BLOCK_SKEW_SIZE + (loadABWarpId_DIV2 * WARP_SIZE + warpLaneId) * 2;
+
+    int* src_ptr_i = reinterpret_cast<int*>(src_ptr);
+    int* dst_ptr_i = reinterpret_cast<int*>(dst_ptr);
+
+    // src_ptr_i += loadABWarpId_DIV22 * 64 * k_strip_DIV2 + loadABWarpId_DIV2 * WARP_SIZE + warpLaneId;
+    // dst_ptr_i += loadABWarpId_DIV22 * 64 * BLOCK_SKEW_SIZE_DIV2 + loadABWarpId_DIV2 * WARP_SIZE + warpLaneId;
+
+    for (int b = 0; b < K; b += BLOCK_SIZE)
+    {
+        // load A and B
+        int* src_ptr_b = src_ptr_i + b * b_strip / 2;
+        int* dst_ptr_b = dst_ptr_i;
+        for (int k = 0; k < 64; k++)
+        {
+            *(dst_ptr_b + k * BLOCK_SKEW_SIZE_DIV2) = src_ptr_b[k * k_strip_DIV2];
+        }
+
+        __syncthreads();
+
+        // 使用wmma,能够达到23%的性能提升
+        /*
+        思路：将128x128的块，划分成2x4的块，每一块一个warp。
+        每一块内部，进一步划分成4x2的16x16的小块，每个小块刚好满足一个warp的计算。
+        */
+        // wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_wmma[WARP_ROW_TILES];
+        // wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_wmma[WARP_COL_TILES];
+
+        uint32_t a_frag[WARP_ROW_TILES * 4];
+        uint32_t b_frag[WARP_COL_TILES * 4];
+
+        half* As_wmma = As + loadAB * BLOCK_SKEW_SIZE * BLOCK_TILE_ROW_STRIP;
+        half* Bs_wmma = Bs + loadABWarpId * BLOCK_TILE_COL_STRIP;
+
+        for (int k = 0; k < K_TILES; k++)
+        {
+            // Load A and B
+            #pragma unroll
+            for (int i = 0; i < WARP_ROW_TILES; i++)
+            {
+                half* ptr = As_wmma + i * WMMA_M * BLOCK_SKEW_SIZE + k * WMMA_K + (warp8 + warp4_row * 8) * BLOCK_SKEW_SIZE + warp4_col * 8;
+                uint32_t smem_ptr;
+                asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 "
+                    "%0, smem_ptr; }\n"
+                    : "=r"(smem_ptr)
+                    : "l"(ptr));
+
+                asm volatile(
+                    "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                    : "=r"(a_frag[i * 4]), "=r"(a_frag[i * 4 + 1]), "=r"(a_frag[i * 4 + 2]), "=r"(a_frag[i * 4 + 3])
+                    : "r"(smem_ptr));
+                // wmma::load_matrix_sync(a_wmma[i], As_wmma + i * WMMA_M * BLOCK_SKEW_SIZE + k * WMMA_K, BLOCK_SKEW_SIZE);
+            }
+
+            #pragma unroll
+            for (int i = 0; i < WARP_COL_TILES; i++)
+            {
+                half* ptr = Bs_wmma + k * WMMA_K * BLOCK_SKEW_SIZE + i * WMMA_N + (warp8 + warp4_row * 8) * BLOCK_SKEW_SIZE + warp4_col * 8;
+                uint32_t smem_ptr;
+                asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 "
+                    "%0, smem_ptr; }\n"
+                    : "=r"(smem_ptr)
+                    : "l"(ptr));
+
+                asm volatile(
+                    "ldmatrix.sync.aligned.x4.m8n8.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                    : "=r"(b_frag[i * 4]), "=r"(b_frag[i * 4 + 1]), "=r"(b_frag[i * 4 + 2]), "=r"(b_frag[i * 4 + 3])
+                    : "r"(smem_ptr));
+                // wmma::load_matrix_sync(b_wmma[i], Bs_wmma + k * WMMA_K * BLOCK_SKEW_SIZE + i * WMMA_N, BLOCK_SKEW_SIZE);
+            }
+
+            // Compute
+            #pragma unroll
+            for (int i = 0; i < WARP_ROW_TILES; i++)
+            {
+                #pragma unroll
+                for (int j = 0; j < WARP_COL_TILES; j++)
+                {
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
+                        : "+r"(c_frag[i * WARP_COL_TILES * 4 + j * 4]), "+r"(c_frag[i * WARP_COL_TILES * 4 + j * 4 + 2])//, "+f"(c_frag_f[i * WARP_COL_TILES * 4 + j * 4 + 2]), "+f"(c_frag_f[i * WARP_COL_TILES * 4 + j * 4 + 3])
+                        : "r"(a_frag[i * 4]), "r"(a_frag[i * 4 + 1]), "r"(a_frag[i * 4 + 2]), "r"(a_frag[i * 4 + 3]), 
+                        "r"(b_frag[j * 4]), "r"(b_frag[j * 4 + 2])
+                        );
+
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
+                        : "+r"(c_frag[i * WARP_COL_TILES * 4 + j * 4 + 1]), "+r"(c_frag[i * WARP_COL_TILES * 4 + j * 4 + 3])
+                        : "r"(a_frag[i * 4]), "r"(a_frag[i * 4 + 1]), "r"(a_frag[i * 4 + 2]), "r"(a_frag[i * 4 + 3]),
+                        "r"(b_frag[j * 4 + 1]), "r"(b_frag[j * 4 + 3])
+                        );
+                }
+            }
+        }
+
+        // __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < WARP_ROW_TILES; i++)
+    {
+        #pragma unroll
+        for (int j = 0; j < WARP_COL_TILES; j++)
+        {
+            unsigned int* ptr = (unsigned int *)(Csub_0 + i * WMMA_M * BLOCK_SKEW_SIZE + j * WMMA_N) + warp_div4 * BLOCK_SKEW_SIZE_DIV2 + warp_div44;
+            int innder = i * WARP_COL_TILES * 4;
+            *ptr = c_frag[innder + j * 4];
+            *(ptr + 4) = c_frag[innder + j * 4 + 1];
+            *(ptr + 8 * BLOCK_SKEW_SIZE_DIV2) = c_frag[innder + j * 4 + 2];
+            *(ptr + 8 * BLOCK_SKEW_SIZE_DIV2 + 4) = c_frag[innder + j * 4 + 3];
+
+            // wmma::store_matrix_sync(Csub_0 + i * WMMA_M * BLOCK_SKEW_SIZE + j * WMMA_N, c_wmma[i][j], BLOCK_SKEW_SIZE, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    // 方案2:store C
+    #pragma unroll
+    for (int i = 0; i < BLOCK_SIZE_DIV8; i++) 
+    {
+        *(Csub + i * N_DIV4) = *(Cs_i2 + BLOCK_SKEW_SIZE_DIV4 * i);
+    }
+}
+
+template <typename T>
+void cuda_gemm_wmma_8(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream)
+{
+    std::cout<<"Unsupported data type: "<<typeid(T).name()<<std::endl;
+}
+
+// GEMM API: 调用 Kernel 并管理 Stream
+template <>
+void cuda_gemm_wmma_8<__half>(size_t M, size_t N, size_t K,
+    __half *A, __half *B, __half *C, 
+    __half alpha, __half beta, cudaStream_t stream) {
+    dim3 blockDim(32, 8, 1);  // 每个 Block 32x8 线程，也就是8个warp，这里的x=32, y=8，x是内循环，y是外循环
+    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
+
+    size_t value = DIV_UP(BLOCK_SIZE * BLOCK_SKEW_SIZE * 2 * sizeof(__half), 64) * 64;
+
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_wmma_kernel_fp16_v8,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        value));
+    // 如果直接调用，会报错，shared memory 超过最大
+    // cudaFuncSetAttribute(gemm_wmma_kernel_fp16_v8, cudaFuncAttributeMaxDynamicSharedMemorySize, value);
+
+    gemm_wmma_kernel_fp16_v8<<<gridDim, blockDim, value, stream>>>(M, N, K, A, B, C, alpha, beta);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+template <>
+void cuda_gemm_wmma_8<float>(size_t m, size_t n, size_t k, float* A, float* B, float* C, float alpha, float beta, cudaStream_t stream)
+{
+    // // Allocate device memory for half-precision matrices
+    // half* d_A, * d_B;
+    // cudaMalloc(&d_A, m * k * sizeof(half));
+    // cudaMalloc(&d_B, k * n * sizeof(half));
+
+    // // Convert A, B from float to half
+    // dim3 blockDim(1024);
+    // dim3 gridDim((m * k + blockDim.x - 1) / blockDim.x);
+    // convert_float_to_half << <gridDim, blockDim, 0, stream >> > (A, d_A, m * k);
+    // gridDim = dim3((k * n + blockDim.x - 1) / blockDim.x);
+    // convert_float_to_half << <gridDim, blockDim, 0, stream >> > (B, d_B, k * n);
+
+    // // Define grid and block dimensions
+    // dim3 blockDimWMMA(16, 16);
+    // dim3 gridDimWMMA((n + WMMA_N - 1) / WMMA_N, (m + WMMA_M - 1) / WMMA_M);
+
+    // // Launch WMMA kernel
+    // wmma_gemm_kernel << <gridDimWMMA, blockDimWMMA, 0, stream >> > (m, n, k, d_A, d_B, C, alpha, beta);
+
+    // // Cleanup
+    // cudaFree(d_A);
+    // cudaFree(d_B);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+template GEMM_EXPORT void cuda_gemm_wmma_8<float>(size_t m, size_t n, size_t k, float *A, float *B, float *C, float alpha, float beta, cudaStream_t stream);
+template GEMM_EXPORT void cuda_gemm_wmma_8<__half>(size_t m, size_t n, size_t k, __half* A, __half* B, __half* C, __half alpha, __half beta, cudaStream_t stream);
 

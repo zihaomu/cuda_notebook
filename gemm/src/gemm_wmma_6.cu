@@ -273,7 +273,7 @@ static __global__ void gemm_wmma_kernel_fp16_v6(size_t M, size_t N, size_t K,
 
         // __syncthreads();
         compute(As_0, Bs_0, loadAB, loadABWarpId, a, b, c_wmma);
-        __syncthreads();
+        // __syncthreads();
         // load A and B to buffer 0
         if (k < K_block_tile)
         {
@@ -288,11 +288,11 @@ static __global__ void gemm_wmma_kernel_fp16_v6(size_t M, size_t N, size_t K,
 
             k += 1;
             // idx ^= 1; // switch double buffer
-            // __syncthreads();
+            __syncthreads();
         }
 
         compute(As_1, Bs_1, loadAB, loadABWarpId, a, b, c_wmma);
-        __syncthreads();
+        // __syncthreads();
     } while (k < K_block_tile);
 
     // store c_wmma to Cs

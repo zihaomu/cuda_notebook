@@ -83,4 +83,16 @@ void cuda_gemm_wmma_5(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T
 template <typename T>
 void cuda_gemm_wmma_6(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream);
 
+// 在4的基础上，使用ldmatrix指令和mma指令。
+template <typename T>
+void cuda_gemm_wmma_8(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream);
+
+// 在5的基础上，使用ldmatrix指令和mma指令。
+template <typename T>
+void cuda_gemm_wmma_9(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream);
+
+// 在5的基础上，使用ldmatrix指令和mma指令。
+template <typename T>
+void cuda_gemm_wmma_10(size_t m, size_t n, size_t k, T *A, T *B, T *C, T alpha, T beta, cudaStream_t stream);
+
 #endif
