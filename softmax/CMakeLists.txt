@@ -20,11 +20,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CUTLASS_NVCC_ARCHS 89)
 
-include_directories("./")
+include_directories("${CMAKE_SOURCE_DIR}/src")
+include_directories("${CMAKE_SOURCE_DIR}/../utils")
 
 file(GLOB src_file
-    "${CMAKE_SOURCE_DIR}/*.cpp"    
-    "${CMAKE_SOURCE_DIR}/*.cu"
+    "${CMAKE_SOURCE_DIR}/src/*.cpp"  
+    "${CMAKE_SOURCE_DIR}/src/*.cu"
+    "${CMAKE_SOURCE_DIR}/../utils/*.cu"
+    "${CMAKE_SOURCE_DIR}/../utils/*.cpp"
 )
 
 message(STATUS "src_file = ${src_file}")
@@ -36,8 +39,9 @@ add_library(cuda_softmax
 
 target_link_libraries(cuda_softmax CUDA::cublas CUDA::cudart)
 
-add_executable(softmax_main_fp32 main_fp32.cpp)
+add_executable(softmax_main_fp32 softmax_main.cpp)
 target_link_libraries(softmax_main_fp32 cuda_softmax CUDA::cublas)
 
 # add_executable(gemm_main_fp16 main_fp16.cpp)
 # target_link_libraries(gemm_main_fp16 cuda_gemm CUDA::cublas)
+

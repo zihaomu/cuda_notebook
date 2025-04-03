@@ -29,7 +29,7 @@ file(GLOB src_file
 
 message(STATUS "src_file = ${src_file}")
 
-add_executable(test_main main_async_copy.cu)
+add_executable(test_main main_shfl_down_sync.cu)
 target_link_libraries(test_main CUDA::cublas)
 
 set_target_properties(test_main PROPERTIES 

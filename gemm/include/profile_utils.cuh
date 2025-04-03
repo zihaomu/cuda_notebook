@@ -82,18 +82,6 @@ float measure_performance(std::function<void(cudaStream_t)> bound_function,
     return latency;
 }
 
-#define CHECK_CUBLASS_ERROR(val) check_cublass((val), #val, __FILE__, __LINE__)
-void check_cublass(cublasStatus_t err, const char* const func,
-                   const char* const file, const int line)
-{
-    if (err != CUBLAS_STATUS_SUCCESS)
-    {
-        std::cerr << "cuBLAS Error at: " << file << ":" << line << std::endl;
-        std::cerr << cublasGetStatusString(err) << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-
 // 弃用，cublasSgemm紧支持float，而且不使用tensor core
 void launch_gemm_cublas_deprecated(size_t m, size_t n, size_t k, float* A, float* B, float* C, float alpha, float beta, cudaStream_t stream)
 {
