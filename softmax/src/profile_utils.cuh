@@ -6,17 +6,26 @@
 
 #include "./utils_function.hpp"
 
-// void print_performance_result(size_t m, size_t n, size_t k, float latency)
-// {
-//     float effective_bandwidth = compute_effective_bandwidth(m, n, k, latency);
-//     float effective_tflops{compute_effective_tflops(m, n, k, latency)};
+#define PEAK_BAND_WITH 1008
 
-//     std::cout << "Latency: " << latency << " ms" << std::endl;
-//     std::cout << "Effective Bandwidth: " << effective_bandwidth << " GB/s"
-//               << std::endl;
-//     std::cout << "Effective TFLOPS: " << effective_tflops << " TFLOPS"
-//               << std::endl;
-// }
+float compute_effective_bandwidth(size_t m, size_t n, float latency)
+{
+    return (m * n * 8 * sizeof(float)) / (latency * 1e-3) / 1e9;
+}
+
+void print_performance_result(size_t m, size_t n, float latency)
+{
+    float effective_bandwidth = compute_effective_bandwidth(m, n, latency);
+    // float effective_tflops{compute_effective_tflops(m, n, k, latency)};
+
+    std::cout << "Latency: " << latency << " ms" << std::endl;
+    std::cout << "Effective Bandwidth: " << effective_bandwidth << " GB/s."
+
+              << std::endl;
+    std::cout<<"Achieve "<< effective_bandwidth /PEAK_BAND_WITH * 100<<"% performance of theoretical bandwidth."<<std::endl;
+    // std::cout << "Effective TFLOPS: " << effective_tflops << " TFLOPS"
+    //           << std::endl;
+}
 
 template <typename T,
           typename std::enable_if<std::is_same<T, float>::value ||
@@ -121,6 +130,9 @@ std::pair<float, float> profile_softmax(
 
     std::cout << "naive kernel performance = "<< naive_latency << " ms." << std::endl;
     std::cout << "boost kernel performance = "<< boost_cuda_softmax << " ms." << std::endl;
+
+    std::cout << "softmax Kernel Performance" << std::endl;
+    print_performance_result(m, n, boost_cuda_softmax);
 
     return std::pair<float, float>{naive_latency, boost_cuda_softmax};
 }
