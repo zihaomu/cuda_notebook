@@ -22,5 +22,9 @@ void cuda_softmax_v0(size_t m, size_t n, T *A, T *C, cudaStream_t stream);
 template <typename T>
 void cuda_softmax_v1(size_t m, size_t n, T *A, T *C, cudaStream_t stream);
 
+// OneFlow 版本的GPU kernel
+template <typename T>
+void cuda_softmax_v2(size_t m, size_t n, T *A, T *C, cudaStream_t stream);
+
 
 #endif // CUDA_SOFTMAX_HPP

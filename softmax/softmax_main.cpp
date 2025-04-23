@@ -9,8 +9,8 @@ using namespace std;
 
 int main() {
     print_device_info();
-    const size_t rows = 512;
-    const size_t cols = 160000; // 实际中，这个数据量太大了，应该跑不起来。
+    const size_t rows = 4096;
+    const size_t cols = 4096; // 实际中，这个数据量太大了，应该跑不起来。
     std::vector<float> input(rows * cols, 0); // 二维vector也不是一个高效
     std::vector<float> output(rows * cols, 0);// 的数据结构，不建议。
 
@@ -31,13 +31,13 @@ int main() {
         }
     }
 
-
     std::vector<std::pair<
     std::string,
     std::function<void(size_t, size_t, float*, float*, cudaStream_t)>>> const
     softmax_kernel_launch_functions{
         {"Naive Softmax Kernel V00", cuda_softmax_v0<float>},
-        {"Naive Softmax Kernel V01: warp reduce", cuda_softmax_v1<float>},
+        // {"Naive Softmax Kernel V01: warp reduce", cuda_softmax_v1<float>},
+        {"Naive Softmax Kernel V02: warp reduce", cuda_softmax_v2<float>},
     };
 
     for (auto const& softmax_kernel_launch_function : softmax_kernel_launch_functions)
