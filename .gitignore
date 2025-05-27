@@ -5,6 +5,7 @@
 *.cubin
 *.fatbin
 **/.idea
+.vscode
 
 # Build files
 **/build/
