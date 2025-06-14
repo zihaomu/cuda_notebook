@@ -38,7 +38,7 @@ attention_mask = torch.tril(torch.ones(max_new_tokens, max_new_tokens)).to(devic
 print(f"attention_mask: {attention_mask.shape}")  # torch.Size([1, 200])
 print(attention_mask)  # torch.Size([1, 200])
 
-input_text = "北京在哪里，经纬度是多少？"
+input_text = "国家主席是谁？"
 
 # 对输入文本分词
 input_ids = tokenizer(input_text, return_tensors="pt").to(device)

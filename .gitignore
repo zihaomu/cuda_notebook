@@ -6,6 +6,7 @@
 *.fatbin
 **/.idea
 .vscode
+**/__pycache__/
 
 # Build files
 **/build/
