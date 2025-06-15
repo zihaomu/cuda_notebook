@@ -72,6 +72,11 @@ for _ in tqdm.tqdm(range(max_new_tokens), desc="Decoding", unit="token"):
     if max_indices == eos_token_id:
         break
     token_out = token_out + tokenizer.decode([max_indices])
+    
+    # add \n when token_out % 20 == 1
+    if count % 20 == 1:
+        token_out += "\n" 
+
     # token_out = token_out
     print(token_out, end="", flush=True)
     # tqdm.tqdm.write(token_out, end="")
