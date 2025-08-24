@@ -42,6 +42,8 @@ from sdpa_attention import sdpa_attention_forward
 from utils_qwen import apply_rotary_pos_emb
 from load_param import load_param
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 # convert "model.layers.*.self_attn.q_proj" to "model.layers.0.self_attn.q_proj"
 def get_idx_from_name(name, idx):
     """
@@ -127,16 +129,17 @@ class Linear:
         :return:
         '''
         assert self.weights is None, "linear not initialized"
-        self.weights = weights
+        self.weights = weights.to(device)
         if self.has_bias:
             assert self.bias is None, "bias not initialized"
-            self.bias = bias
+            self.bias = bias.to(device)
 
     def forward(self, x):
         # 检查维度是否正确
         # TODO 使用triton实现linear
         assert self.weights is not None, "linear not initialized"
         if self.has_bias:
+            # print all params shape
             # use torch matmul instead of np.matmul
             return torch.matmul(x, self.weights.T) + self.bias
             # return np.matmul(x, self.weights.T) + self.bias
@@ -161,6 +164,8 @@ class WordEmbedding:
         '''
         assert self.weights is None, "embedding not initialized"
         self.weights = weights
+        # print weights shape
+        print(f"WordEmbedding weights shape: {self.weights.shape}")
 
     def forward(self, input_ids):
 
@@ -204,7 +209,7 @@ class Qwen2RMSNorm:
         :return:
         '''
         assert self.weight is None, "rmsnorm not initialized"
-        self.weight = weight
+        self.weight = weight.to(device)
                 
         # print(f"Qwen2RMSNorm:, {self.weight.shape}")
         
@@ -491,7 +496,7 @@ class Qwen2RotaryEmbedding:
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos.to(dtype=x.dtype).to(device), sin.to(dtype=x.dtype).to(device)
 
 
 class Qwen2Model:
@@ -501,7 +506,7 @@ class Qwen2Model:
         self.word_embedding = WordEmbedding(config.vocab_size, config.hidden_size)
         self.layers = [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         self.layer_norm = Qwen2RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config, device=device)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, has_bias=False)
 
     def load(self):
@@ -542,7 +547,7 @@ class Qwen2Model:
     def forward(self, input_ids, attention_mask=None, position_ids=None):
         
         # word embedding
-        hidden_states = self.word_embedding.forward(input_ids)
+        hidden_states = self.word_embedding.forward(input_ids).to(device)
 
         # TODO 检查 hidden_state
 
@@ -565,5 +570,5 @@ class Qwen2Model:
         
         # print(f"hidden_states: {hidden_states.shape}")  # torch.Size([1, 12, 1536])
         # print(f"lm_logits: {lm_logits.shape}")
-        return lm_logits[:, -1, :]
+        return lm_logits[:, -1, :].to("cpu")  # return the last token logits, shape: [1, 151936]
 

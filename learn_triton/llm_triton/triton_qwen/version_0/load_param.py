@@ -57,6 +57,15 @@ path = "E:\my_project\DeepSeek-R1-Distill-Qwen-1.5B\model.safetensors"
 # path = "E:\my_project\llava-fastvithd_0.5b_stage2\model.safetensors"
 state_dict = load_file(path)
 
+def load_parm_fp16(param_name):
+    # find if param_name in state_dict
+    if param_name in state_dict:
+        bf16_tensor = state_dict[param_name]
+        return bf16_tensor
+
+    else:
+        raise ValueError(f"Parameter {param_name} not found in state_dict")
+
 def load_param(param_name):
     # find if param_name in state_dict
     if param_name in state_dict:
